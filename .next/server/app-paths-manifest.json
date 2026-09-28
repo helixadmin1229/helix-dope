@@ -1,0 +1,10 @@
+{
+  "/_not-found/page": "app/_not-found/page.js",
+  "/api/workflow/[id]/action/route": "app/api/workflow/[id]/action/route.js",
+  "/api/workflow/[id]/simulate/route": "app/api/workflow/[id]/simulate/route.js",
+  "/api/workflow/route": "app/api/workflow/route.js",
+  "/api/worker/route": "app/api/worker/route.js",
+  "/api/workflow/[id]/route": "app/api/workflow/[id]/route.js",
+  "/page": "app/page.js",
+  "/api/workflow/[id]/drill/route": "app/api/workflow/[id]/drill/route.js"
+}

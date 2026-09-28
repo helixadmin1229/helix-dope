@@ -1,0 +1,177 @@
+﻿<!DOCTYPE html>
+<!--
+  supabase-realtime-test.html
+  Open this file directly in a browser to verify Supabase Realtime
+  is working before you deploy your full app.
+
+  Steps:
+  1. Fill in your SUPABASE_URL and SUPABASE_ANON_KEY below
+  2. Open this file in a browser (file:// works)
+  3. Click "Connect"
+  4. In another tab, insert a row in workflow_events (via SQL Editor)
+  5. You should see the event appear in real time here
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DOPE â€” Realtime Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #07070f; color: #e2e8f0; font-family: monospace; padding: 24px; }
+    h1   { font-size: 14px; letter-spacing: 4px; margin-bottom: 20px; color: #6366f1; }
+    .row { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+    input, button { font-family: monospace; font-size: 12px; padding: 8px 12px; border-radius: 4px; border: 1px solid #252540; }
+    input  { background: #111122; color: #e2e8f0; flex: 1; min-width: 300px; }
+    button { background: #6366f1; color: white; border-color: #6366f1; cursor: pointer; white-space: nowrap; }
+    button:disabled { background: #1f2937; color: #4b5563; border-color: #1f2937; cursor: not-allowed; }
+    #status { font-size: 11px; padding: 6px 10px; border-radius: 4px; margin-bottom: 16px; }
+    .idle       { background: #1f2937; color: #64748b; }
+    .connecting { background: #1e1e0a; color: #d97706; }
+    .connected  { background: #0a1a0a; color: #10b981; }
+    .error      { background: #1a0a0a; color: #f43f5e; }
+    #log { background: #0a0a14; border: 1px solid #1a1a2e; border-radius: 4px; padding: 12px; min-height: 200px; max-height: 400px; overflow-y: auto; }
+    .event { font-size: 11px; color: #6b7280; margin-bottom: 6px; line-height: 1.4; }
+    .event .time  { color: #374151; }
+    .event .type  { color: #6366f1; }
+    .event .badge { color: #10b981; }
+    .event.new    { animation: flash 0.4s ease; }
+    @keyframes flash { from { background: #6366f122; } to { background: transparent; } }
+    #test-btn { background: #059669; border-color: #059669; }
+    .tip { font-size: 11px; color: #374151; margin-top: 16px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>DOPE â€” SUPABASE REALTIME TEST</h1>
+
+  <div class="row">
+    <input id="url"  type="text" placeholder="https://xxxx.supabase.co" value="" />
+    <input id="key"  type="text" placeholder="anon key (eyJ...)"        value="" />
+  </div>
+  <div class="row">
+    <input id="wfid" type="text" placeholder="workflow_id to watch (or leave blank for all)" value="" />
+    <button id="connect-btn" onclick="connect()">Connect</button>
+    <button id="test-btn"    onclick="insertTest()" disabled>Insert test event</button>
+    <button onclick="clearLog()">Clear</button>
+  </div>
+
+  <div id="status" class="idle">â— Not connected</div>
+  <div id="log"><div class="event"><span class="time">--:--:--</span> Waiting for connection...</div></div>
+
+  <div class="tip">
+    <strong>To test manually via Supabase SQL Editor:</strong><br>
+    INSERT INTO workflow_events (workflow_id, type, payload, source)<br>
+    VALUES ('your-workflow-id', 'TEST_EVENT', '{"hello":"world"}', 'system');
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <script>
+    let db = null;
+    let channel = null;
+    let eventCount = 0;
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById("status");
+      el.textContent = msg;
+      el.className = cls;
+    }
+
+    function addLog(html, isNew = false) {
+      const log = document.getElementById("log");
+      const div = document.createElement("div");
+      div.className = "event" + (isNew ? " new" : "");
+      div.innerHTML = html;
+      log.insertBefore(div, log.firstChild);
+    }
+
+    function now() {
+      return new Date().toLocaleTimeString();
+    }
+
+    function clearLog() {
+      document.getElementById("log").innerHTML = "";
+    }
+
+    async function connect() {
+      const url  = document.getElementById("url").value.trim();
+      const key  = document.getElementById("key").value.trim();
+      const wfid = document.getElementById("wfid").value.trim();
+
+      if (!url || !key) {
+        setStatus("â— Enter Supabase URL and anon key", "error");
+        return;
+      }
+
+      if (channel) { channel.unsubscribe(); channel = null; }
+
+      setStatus("â— Connecting...", "connecting");
+      addLog(`<span class="time">${now()}</span> Connecting to ${url}...`);
+
+      try {
+        db = supabase.createClient(url, key);
+
+        const filter = wfid
+          ? { event: "INSERT", schema: "public", table: "workflow_events", filter: `workflow_id=eq.${wfid}` }
+          : { event: "INSERT", schema: "public", table: "workflow_events" };
+
+        channel = db.channel("dope-test")
+          .on("postgres_changes", filter, (payload) => {
+            eventCount++;
+            const e   = payload.new;
+            const src = e.source === "human" ? "ðŸ§‘" : e.source === "llm" ? "ðŸ¤–" : "âš™";
+            addLog(
+              `<span class="time">${now()}</span> ` +
+              `<span class="badge">${src} NEW</span> ` +
+              `<span class="type">${e.type}</span> ` +
+              `seq:${e.seq ?? "?"} ` +
+              `wf:${(e.workflow_id ?? "").slice(0, 8)}... ` +
+              `payload:${JSON.stringify(e.payload ?? {}).slice(0, 60)}`,
+              true
+            );
+            document.getElementById("status").textContent = `â— Connected â€” ${eventCount} event(s) received`;
+          })
+          .subscribe((status) => {
+            if (status === "SUBSCRIBED") {
+              setStatus("â— Connected" + (wfid ? ` â€” watching ${wfid.slice(0, 8)}...` : " â€” watching all events"), "connected");
+              addLog(`<span class="time">${now()}</span> <span class="badge">âœ“</span> Realtime subscription active`);
+              document.getElementById("test-btn").disabled = false;
+            } else if (status === "CHANNEL_ERROR") {
+              setStatus("â— Connection error â€” check URL and anon key", "error");
+              addLog(`<span class="time">${now()}</span> âŒ Channel error`);
+            } else if (status === "TIMED_OUT") {
+              setStatus("â— Timed out â€” retrying...", "connecting");
+            } else {
+              addLog(`<span class="time">${now()}</span> Status: ${status}`);
+            }
+          });
+      } catch (err) {
+        setStatus(`â— Error: ${err.message}`, "error");
+        addLog(`<span class="time">${now()}</span> âŒ ${err.message}`);
+      }
+    }
+
+    async function insertTest() {
+      if (!db) return;
+
+      const wfid = document.getElementById("wfid").value.trim() || "test-" + Date.now();
+      const { error } = await db.from("workflow_events").insert({
+        workflow_id: wfid,
+        type:        "TEST_EVENT",
+        payload:     { source: "realtime_test", timestamp: Date.now() },
+        source:      "system",
+      });
+
+      if (error) {
+        addLog(`<span class="time">${now()}</span> âŒ Insert failed: ${error.message} (need service role key to insert)`);
+      } else {
+        addLog(`<span class="time">${now()}</span> âœ“ Test event inserted â€” should appear above within 1s`);
+      }
+    }
+
+    // Pre-fill from URL params if provided
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("url")) document.getElementById("url").value = params.get("url");
+    if (params.get("key")) document.getElementById("key").value = params.get("key");
+    if (params.get("wfid")) document.getElementById("wfid").value = params.get("wfid");
+  </script>
+</body>
+</html>

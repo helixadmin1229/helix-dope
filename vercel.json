@@ -1,0 +1,1 @@
+{"functions":{"app/api/worker/route.ts":{"maxDuration":60},"app/api/workflow/route.ts":{"maxDuration":10},"app/api/workflow/[id]/route.ts":{"maxDuration":10},"app/api/workflow/[id]/drill/route.ts":{"maxDuration":10},"app/api/workflow/[id]/simulate/route.ts":{"maxDuration":30}}}
