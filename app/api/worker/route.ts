@@ -49,11 +49,56 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const db = getServerClient();
+  // â”€â”€ Diagnostics: check env vars first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const diagMode = req.nextUrl.searchParams.get("diag") === "1";
+  if (diagMode) {
+    return NextResponse.json({
+      env: {
+        SUPABASE_URL:        !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+        SUPABASE_ANON_KEY:   !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+        SERVICE_ROLE_KEY:    !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+        OPENROUTER_API_KEY:  !!process.env.OPENROUTER_API_KEY,
+        LLM_PROVIDER:        process.env.LLM_PROVIDER ?? "openrouter (default)",
+        OPENROUTER_MODEL:    process.env.OPENROUTER_MODEL ?? "meta-llama/llama-3.1-8b-instruct:free (default)",
+        WORKER_CRON_SECRET:  !!process.env.WORKER_CRON_SECRET,
+      }
+    });
+  }
 
-  // Claim one job atomically
-  const { data: job, error } = await db.rpc("claim_next_job");
-  if (error || !job) {
+  let db: any;
+  try {
+    db = getServerClient();
+  } catch (e) {
+    return NextResponse.json({
+      processed: false,
+      error: "Supabase config error: " + String(e),
+      hint: "Check NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel env vars"
+    }, { status: 500 });
+  }
+
+  // â”€â”€ Claim one job atomically â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  let job: any = null;
+  try {
+    const { data, error } = await db.rpc("claim_next_job");
+    if (error) {
+      return NextResponse.json({
+        processed: false,
+        error: error.message,
+        hint: error.message.includes("claim_next_job")
+          ? "Schema not applied â€” run schema.sql in Supabase SQL Editor"
+          : "Database error"
+      }, { status: 500 });
+    }
+    job = data;
+  } catch (e) {
+    return NextResponse.json({
+      processed: false,
+      error: String(e),
+      hint: "Could not connect to Supabase â€” check your env vars"
+    }, { status: 500 });
+  }
+
+  if (!job) {
     return NextResponse.json({ processed: false, reason: "no_jobs" });
   }
 
