@@ -1,0 +1,630 @@
+﻿// ============================================================
+// app/api/worker/route.ts
+// GET /api/worker â€” claim and process one job from the queue.
+//
+// Trigger this endpoint every 5â€“10 seconds via:
+//   - Supabase Edge Functions cron
+//   - Vercel cron (vercel.json)
+//   - External scheduler (cron-job.org, etc.)
+//
+// Each invocation processes ONE job and returns.
+// Run multiple concurrent invocations for parallelism.
+// ============================================================
+
+import { NextRequest, NextResponse } from "next/server";
+import { getServerClient } from "@/lib/supabase";
+import { callLLMJSON } from "@/lib/llm";
+
+const CRON_SECRET = process.env.WORKER_CRON_SECRET ?? "";
+
+// ============================================================
+// Lens configuration
+// ============================================================
+
+const LENS_CONFIGS: Record<
+  string,
+  {
+    system: string;
+    userPrompt: (ctx: string, count: number) => string;
+  }
+> = {
+  market_gap: {
+    system:
+      "You are a sharp SaaS market researcher. Find real market gaps where existing tools are weak.",
+    userPrompt: (ctx, n) =>
+      `Research SaaS market gaps ${
+        ctx ? "in: " + ctx : "across B2B software"
+      }.\nReturn ONLY: {"ideas":[{"id":"idea_1","name":"Name","tagline":"Value prop","problem":"Pain","target":"Persona","gap":"Why solutions fail","signals":["s1","s2"],"difficulty":"low","marketSize":"medium","score":72,"confidence":80,"tags":["B2B"]}]}\nGenerate ${n} ideas. No markdown.`,
+  },
+
+  pain_driven: {
+    system:
+      "You are a SaaS researcher who mines reviews and Reddit for recurring complaints.",
+    userPrompt: (ctx, n) =>
+      `Find SaaS ideas from documented pain points ${
+        ctx ? "in " + ctx : "in B2B"
+      }.\nReturn ONLY: {"ideas":[{"id":"idea_1","name":"Name","tagline":"Value prop","problem":"Complaint","target":"Who","gap":"Why no fix","signals":["s1","s2"],"difficulty":"low","marketSize":"medium","score":72,"confidence":80,"tags":["B2B"]}]}\nGenerate ${n} ideas. No markdown.`,
+  },
+
+  trend_riding: {
+    system:
+      "You are a SaaS trend analyst. Find structural shifts and the SaaS opportunities they create.",
+    userPrompt: (ctx, n) =>
+      `Find SaaS ideas riding structural trends ${ctx ? "in " + ctx : ""}.\nReturn ONLY: {"ideas":[{"id":"idea_1","name":"Name","tagline":"Value prop","problem":"Trend need","target":"Who","gap":"Why solutions miss","signals":["s1","s2"],"difficulty":"low","marketSize":"medium","score":72,"confidence":80,"tags":["AI-native"]}]}\nGenerate ${n} ideas. No markdown.`,
+  },
+
+  niche_vertical: {
+    system:
+      "You are a vertical SaaS researcher. Find industries where generic tools fail.",
+    userPrompt: (ctx, n) =>
+      `Find vertical SaaS opportunities ${ctx ? "in " + ctx : ""}.\nReturn ONLY: {"ideas":[{"id":"idea_1","name":"Name","tagline":"Value prop","problem":"Generic tool pain","target":"Role + industry","gap":"What generic tools miss","signals":["s1","s2"],"difficulty":"low","marketSize":"medium","score":72,"confidence":80,"tags":["vertical"]}]}\nGenerate ${n} ideas. No markdown.`,
+  },
+};
+
+const ALL_LENSES = Object.keys(LENS_CONFIGS);
+
+// ============================================================
+// Worker endpoint
+// ============================================================
+
+export async function GET(req: NextRequest) {
+  // Optional secret check in production.
+  const secret =
+    req.headers.get("x-cron-secret") ??
+    req.nextUrl.searchParams.get("secret");
+
+  if (CRON_SECRET && secret !== CRON_SECRET) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const db = getServerClient();
+
+  // ----------------------------------------------------------
+  // Claim one due job.
+  //
+  // We first find the oldest due pending job, then conditionally
+  // update it. The status predicate prevents processing a job
+  // that another worker has already claimed.
+  // ----------------------------------------------------------
+
+  const { data: pendingJobs, error: claimReadError } = await db
+    .from("workflow_jobs")
+    .select("*")
+    .eq("status", "pending")
+    .lte("run_at", new Date().toISOString())
+    .order("run_at", { ascending: true })
+    .limit(1);
+
+  if (claimReadError) {
+    console.error("[worker] claim read error:", claimReadError);
+
+    return NextResponse.json(
+      {
+        processed: false,
+        reason: "claim_error",
+        error: claimReadError.message,
+      },
+      { status: 500 }
+    );
+  }
+
+  const candidate = pendingJobs?.[0];
+
+  if (!candidate) {
+    console.log("[worker] no due jobs");
+
+    return NextResponse.json({
+      processed: false,
+      reason: "no_jobs",
+    });
+  }
+
+  const { data: job, error: claimUpdateError } = await db
+    .from("workflow_jobs")
+    .update({
+      status: "running",
+      started_at: new Date().toISOString(),
+      attempts: (candidate.attempts ?? 0) + 1,
+    })
+    .eq("id", candidate.id)
+    .eq("status", "pending")
+    .select("*")
+    .single();
+
+  if (claimUpdateError) {
+    console.error("[worker] claim update error:", claimUpdateError);
+
+    return NextResponse.json(
+      {
+        processed: false,
+        reason: "claim_error",
+        error: claimUpdateError.message,
+      },
+      { status: 500 }
+    );
+  }
+
+  if (!job) {
+    console.log("[worker] job was already claimed:", candidate.id);
+
+    return NextResponse.json({
+      processed: false,
+      reason: "already_claimed",
+    });
+  }
+
+  console.log(
+    `[worker] processing job ${job.id} (${job.job_type}) for workflow ${job.workflow_id}`
+  );
+
+  const start = Date.now();
+
+  // ----------------------------------------------------------
+  // Process the claimed job
+  // ----------------------------------------------------------
+
+  try {
+    await processJob(db, job);
+
+    const { error: completeError } = await db
+      .from("workflow_jobs")
+      .update({
+        status: "completed",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", job.id);
+
+    if (completeError) {
+      throw new Error(
+        `Failed to mark job completed: ${completeError.message}`
+      );
+    }
+
+    const durationMs = Date.now() - start;
+
+    console.log(
+      `[worker] job ${job.id} completed in ${durationMs}ms`
+    );
+
+    return NextResponse.json({
+      processed: true,
+      jobId: job.id,
+      durationMs,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+
+    console.error(`[worker] job ${job.id} failed:`, message);
+
+    const attempts = job.attempts ?? 1;
+    const maxAttempts = job.max_attempts ?? 3;
+    const isDead = attempts >= maxAttempts;
+
+    const retryAt = new Date(
+      Date.now() + Math.pow(2, attempts) * 1000
+    ).toISOString();
+
+    const { error: failureUpdateError } = await db
+      .from("workflow_jobs")
+      .update({
+        status: isDead ? "dead" : "pending",
+        error: message,
+        ...(isDead ? {} : { run_at: retryAt }),
+      })
+      .eq("id", job.id);
+
+    if (failureUpdateError) {
+      console.error(
+        `[worker] failed to update job ${job.id}:`,
+        failureUpdateError
+      );
+    }
+
+    if (isDead) {
+      const { error: eventError } = await db
+        .from("workflow_events")
+        .insert({
+          workflow_id: job.workflow_id,
+          type: "WORKFLOW_FAILED",
+          payload: {
+            message,
+            jobId: job.id,
+            jobType: job.job_type,
+          },
+          source: "system",
+        });
+
+      if (eventError) {
+        console.error(
+          `[worker] failed to write WORKFLOW_FAILED event for ${job.id}:`,
+          eventError
+        );
+      }
+    }
+
+    return NextResponse.json(
+      {
+        processed: false,
+        error: message,
+      },
+      { status: 500 }
+    );
+  }
+}
+
+// ============================================================
+// Job processors
+// ============================================================
+
+async function processJob(
+  db: any,
+  job: any
+): Promise<void> {
+  const p = job.payload as Record<string, any>;
+
+  switch (job.job_type) {
+    case "run_workflow": {
+      const {
+        context = "",
+        count = 5,
+        lens,
+        mode = "batch",
+      } = p;
+
+      const lenses =
+        mode === "batch"
+          ? ALL_LENSES
+          : [lens ?? "market_gap"];
+
+      for (const lensId of lenses) {
+        await runLens(
+          db,
+          job.workflow_id,
+          lensId,
+          context,
+          count
+        );
+      }
+
+      // Emit IDEAS_MERGED after all lenses are complete.
+      const { data: ideaEvents, error: ideaEventsError } = await db
+        .from("workflow_events")
+        .select("payload")
+        .eq("workflow_id", job.workflow_id)
+        .eq("type", "LENS_COMPLETED");
+
+      if (ideaEventsError) {
+        throw new Error(
+          `Failed to load lens results: ${ideaEventsError.message}`
+        );
+      }
+
+      const allIdeas = (ideaEvents ?? []).flatMap(
+        (event: any) => event.payload?.ideas ?? []
+      );
+
+      const merged = dedup(allIdeas);
+
+      const { error: mergedError } = await db
+        .from("workflow_events")
+        .insert({
+          workflow_id: job.workflow_id,
+          type: "IDEAS_MERGED",
+          payload: { ideas: merged },
+          source: "system",
+        });
+
+      if (mergedError) {
+        throw new Error(
+          `Failed to write IDEAS_MERGED: ${mergedError.message}`
+        );
+      }
+
+      const { error: completedEventError } = await db
+        .from("workflow_events")
+        .insert({
+          workflow_id: job.workflow_id,
+          type: "WORKFLOW_COMPLETED",
+          payload: {
+            ideaCount: merged.length,
+          },
+          source: "system",
+        });
+
+      if (completedEventError) {
+        throw new Error(
+          `Failed to write WORKFLOW_COMPLETED: ${completedEventError.message}`
+        );
+      }
+
+      const { error: workflowUpdateError } = await db
+        .from("workflows")
+        .update({
+          status: "completed",
+        })
+        .eq("id", job.workflow_id);
+
+      if (workflowUpdateError) {
+        throw new Error(
+          `Failed to mark workflow completed: ${workflowUpdateError.message}`
+        );
+      }
+
+      break;
+    }
+
+    case "run_lens": {
+      const {
+        lensId,
+        context = "",
+        count = 5,
+      } = p;
+
+      await runLens(
+        db,
+        job.workflow_id,
+        lensId,
+        context,
+        count
+      );
+
+      break;
+    }
+
+    case "run_drill": {
+      const { idea } = p;
+
+      if (!idea) {
+        throw new Error(
+          "run_drill: idea missing from payload"
+        );
+      }
+
+      await runDrill(
+        db,
+        job.workflow_id,
+        idea
+      );
+
+      break;
+    }
+
+    case "run_opinion": {
+      const {
+        idea,
+        originalLens,
+      } = p;
+
+      if (!idea) {
+        throw new Error(
+          "run_opinion: idea missing from payload"
+        );
+      }
+
+      await runOpinion(
+        db,
+        job.workflow_id,
+        idea,
+        originalLens ?? "market_gap"
+      );
+
+      break;
+    }
+
+    default:
+      throw new Error(
+        `Unknown job type: ${job.job_type}`
+      );
+  }
+}
+
+// ============================================================
+// Activity functions
+// ============================================================
+
+async function runLens(
+  db: any,
+  workflowId: string,
+  lensId: string,
+  context: string,
+  count: number
+): Promise<void> {
+  const cfg = LENS_CONFIGS[lensId];
+
+  if (!cfg) {
+    throw new Error(`Unknown lens: ${lensId}`);
+  }
+
+  const { error: startedError } = await db
+    .from("workflow_events")
+    .insert({
+      workflow_id: workflowId,
+      type: "LENS_STARTED",
+      payload: {
+        lens: lensId,
+      },
+      source: "system",
+    });
+
+  if (startedError) {
+    throw new Error(
+      `Failed to write LENS_STARTED: ${startedError.message}`
+    );
+  }
+
+  const result = await callLLMJSON(
+    {
+      system: cfg.system,
+      user: cfg.userPrompt(context, count),
+      maxTokens: 2500,
+    },
+    {
+      ideas: [],
+    }
+  );
+
+  const ideas = (result.ideas ?? []).map(
+    (idea: any, i: number) => ({
+      ...idea,
+      id: `${lensId}_${i}_${Date.now()}`,
+      _lens: lensId,
+    })
+  );
+
+  const { error: completedError } = await db
+    .from("workflow_events")
+    .insert({
+      workflow_id: workflowId,
+      type: "LENS_COMPLETED",
+      payload: {
+        lens: lensId,
+        ideas,
+      },
+      source: "llm",
+    });
+
+  if (completedError) {
+    throw new Error(
+      `Failed to write LENS_COMPLETED: ${completedError.message}`
+    );
+  }
+}
+
+async function runDrill(
+  db: any,
+  workflowId: string,
+  idea: any
+): Promise<void> {
+  const system =
+    "You are a SaaS due-diligence analyst. Rigorous, name real competitors, identify real risks. Return JSON only.";
+
+  const user =
+    `Deep-dive and return ONLY:\n` +
+    `{"competitors":[{"name":"X","weakness":"Y"}],"gtm":"First 100 customers","techRisk":"Risk","marketRisk":"Risk","arr12m":"ARR","verdict":"GO","verdictReason":"One line","mvpWeeks":8,"mvpTeam":"solo","mvpCost":"$0-5k","summary":"200 word analysis"}\n\n` +
+    `Name: ${idea.name}\n` +
+    `Problem: ${idea.problem}\n` +
+    `Target: ${idea.target}\n` +
+    `Gap: ${idea.gap}`;
+
+  const report = await callLLMJSON(
+    {
+      system,
+      user,
+      maxTokens: 1500,
+    },
+    {
+      verdict: "MAYBE",
+      verdictReason: "Parse error",
+      competitors: [],
+      gtm: "",
+      techRisk: "",
+      marketRisk: "",
+      arr12m: "",
+      mvpWeeks: null,
+      mvpTeam: "",
+      mvpCost: "",
+      summary: "",
+    }
+  );
+
+  const { error } = await db
+    .from("workflow_events")
+    .insert({
+      workflow_id: workflowId,
+      type: "DRILL_COMPLETED",
+      payload: {
+        ideaId: idea.id,
+        report,
+      },
+      source: "llm",
+    });
+
+  if (error) {
+    throw new Error(
+      `Failed to write DRILL_COMPLETED: ${error.message}`
+    );
+  }
+}
+
+async function runOpinion(
+  db: any,
+  workflowId: string,
+  idea: any,
+  originalLens: string
+): Promise<void> {
+  const others = ALL_LENSES.filter(
+    (lens) => lens !== originalLens
+  );
+
+  const lens =
+    others[Math.floor(Math.random() * others.length)];
+
+  const system =
+    `You are a SaaS analyst giving a second opinion from a ${lens} perspective.`;
+
+  const user =
+    `Second opinion on: ${idea.name} â€” ${idea.tagline}\n` +
+    `Problem: ${idea.problem}\n\n` +
+    `Return ONLY: {"agreement":"agree|partial|disagree","newAngle":"What this adds","revisedScore":72,"revisedConfidence":65,"keyInsight":"Most important insight"}`;
+
+  const opinion = await callLLMJSON(
+    {
+      system,
+      user,
+      maxTokens: 600,
+    },
+    {
+      agreement: "partial",
+      newAngle: "",
+      revisedScore: idea.score,
+      revisedConfidence: 50,
+      keyInsight: "",
+    }
+  );
+
+  const { error } = await db
+    .from("workflow_events")
+    .insert({
+      workflow_id: workflowId,
+      type: "OPINION_COMPLETED",
+      payload: {
+        ideaId: idea.id,
+        lens,
+        opinion,
+      },
+      source: "llm",
+    });
+
+  if (error) {
+    throw new Error(
+      `Failed to write OPINION_COMPLETED: ${error.message}`
+    );
+  }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function dedup(ideas: any[]): any[] {
+  return ideas.reduce(
+    (acc: any[], idea) => {
+      const ex = acc.find(
+        (x) =>
+          x.name?.toLowerCase().slice(0, 6) ===
+          idea.name?.toLowerCase().slice(0, 6)
+      );
+
+      return !ex || idea.score > ex.score
+        ? [
+            ...(ex
+              ? acc.filter((x) => x !== ex)
+              : acc),
+            idea,
+          ]
+        : acc;
+    },
+    []
+  );
+}
+
