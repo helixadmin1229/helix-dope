@@ -1,9 +1,20 @@
-﻿/** @type {import('next').NextConfig} */
+/** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Allow longer serverless function timeout for multi-lens batch runs
   experimental: {
     serverComponentsExternalPackages: ["@anthropic-ai/sdk"],
   },
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          {
+            key: "Content-Type",
+            value: "text/html; charset=utf-8",
+          },
+        ],
+      },
+    ];
+  },
 };
-
 module.exports = nextConfig;

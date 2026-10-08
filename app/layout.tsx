@@ -1,13 +1,19 @@
+"use server";
 import type { Metadata } from "next";
+import "./globals.css";
+
 export const metadata: Metadata = {
   title: "DOPE - Helix AI",
   description: "AI-powered SaaS idea research engine",
-  charset: "utf-8",
 };
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <head><meta charSet="utf-8" /></head>
+      <head>
+        <meta httpEquiv="Content-Type" content="text/html; charset=utf-8" />
+        <meta charSet="utf-8" />
+      </head>
       <body>{children}</body>
     </html>
   );
